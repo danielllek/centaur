@@ -20,7 +20,15 @@ from pathlib import Path
 REPOSITORY_VISIBILITIES = {"private", "public"}
 PUBLIC_REPOSITORY_VISIBILITY = "public"
 PRIVATE_REPOSITORY_VISIBILITY = "private"
-GIT_LOCK_NAMES = ("index.lock", "config.lock", "packed-refs.lock", "shallow.lock")
+GIT_LOCK_NAMES = (
+    "index.lock",
+    "config.lock",
+    "packed-refs.lock",
+    "shallow.lock",
+    "HEAD.lock",
+    "ORIG_HEAD.lock",
+    "FETCH_HEAD.lock",
+)
 
 
 class ShutdownRequested(Exception):
@@ -292,8 +300,25 @@ class RepoCacheSync:
         git_dir = target / ".git"
         if not git_dir.is_dir() or git_dir.is_symlink():
             return
-        for name in GIT_LOCK_NAMES:
-            lock = git_dir / name
+        locks = [git_dir / name for name in GIT_LOCK_NAMES]
+        directories = [git_dir / "refs"]
+        while directories:
+            directory = directories.pop()
+            try:
+                mode = directory.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(mode):
+                raise RuntimeError(
+                    f"Refusing to traverse non-directory Git refs: {directory}"
+                )
+            for entry in directory.iterdir():
+                if entry.name.endswith(".lock"):
+                    locks.append(entry)
+                elif stat.S_ISDIR(entry.lstat().st_mode):
+                    directories.append(entry)
+
+        for lock in locks:
             try:
                 mode = lock.lstat().st_mode
             except FileNotFoundError:

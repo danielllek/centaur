@@ -82,21 +82,78 @@ class RepoCacheSyncTest(unittest.TestCase):
                 stopper.join(timeout=2)
             self.assertFalse(stopper.is_alive())
 
-    def test_recovers_only_regular_git_locks(self) -> None:
+    def test_recovers_regular_git_locks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             target = root / "cache" / "private" / "acme" / "centaur"
             git_dir = target / ".git"
-            git_dir.mkdir(parents=True)
-            stale = git_dir / "index.lock"
-            stale.write_text("stale")
+            names = (
+                "index.lock",
+                "config.lock",
+                "packed-refs.lock",
+                "shallow.lock",
+                "HEAD.lock",
+                "ORIG_HEAD.lock",
+                "FETCH_HEAD.lock",
+                "refs/heads/feature/topic.lock",
+                "refs/remotes/origin/main.lock",
+                "refs/tags/v1.lock",
+            )
+            for name in names:
+                lock = git_dir / name
+                lock.parent.mkdir(parents=True, exist_ok=True)
+                lock.write_text("stale")
+            ref = git_dir / "refs/heads/main"
+            ref.write_text("keep")
             sync = self.make_sync(root)
             sync.recover_stale_git_locks(target)
-            self.assertFalse(stale.exists())
+            for name in names:
+                self.assertFalse((git_dir / name).exists(), name)
+            self.assertEqual(ref.read_text(), "keep")
+            sync.recover_stale_git_locks(target)
 
-            stale.symlink_to(root / "do-not-delete")
-            with self.assertRaisesRegex(RuntimeError, "non-regular Git lock"):
+    def test_refuses_non_regular_git_locks(self) -> None:
+        for name in ("index.lock", "HEAD.lock", "refs/heads/main.lock"):
+            for kind in ("symlink", "directory"):
+                with (
+                    self.subTest(name=name, kind=kind),
+                    tempfile.TemporaryDirectory() as tmp,
+                ):
+                    root = Path(tmp)
+                    target = root / "checkout"
+                    lock = target / ".git" / name
+                    lock.parent.mkdir(parents=True)
+                    protected = root / "protected"
+                    protected.write_text("keep")
+                    if kind == "symlink":
+                        lock.symlink_to(protected)
+                    else:
+                        lock.mkdir()
+                    with self.assertRaisesRegex(RuntimeError, "non-regular Git lock"):
+                        self.make_sync(root).recover_stale_git_locks(target)
+                    self.assertTrue(lock.exists())
+                    self.assertEqual(protected.read_text(), "keep")
+
+    def test_does_not_follow_symlinked_ref_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "checkout"
+            refs = target / ".git/refs"
+            refs.mkdir(parents=True)
+            outside = root / "outside"
+            outside.mkdir()
+            lock = outside / "main.lock"
+            lock.write_text("keep")
+            (refs / "heads").symlink_to(outside, target_is_directory=True)
+            sync = self.make_sync(root)
+            sync.recover_stale_git_locks(target)
+            self.assertEqual(lock.read_text(), "keep")
+            (refs / "heads").unlink()
+            refs.rmdir()
+            refs.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "non-directory Git refs"):
                 sync.recover_stale_git_locks(target)
+            self.assertEqual(lock.read_text(), "keep")
 
     def test_second_writer_does_not_remove_readiness(self) -> None:
         import fcntl
@@ -281,7 +338,7 @@ class RepoCacheSyncTest(unittest.TestCase):
             self.assertTrue((target / ".git").is_dir())
             self.assertFalse(old.exists())
 
-    def test_sync_repo_updates_checkout_after_upstream_tag_moves(self) -> None:
+    def test_sync_repo_recovers_ref_locks_after_upstream_tag_moves(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             git_env = {
@@ -333,9 +390,11 @@ class RepoCacheSyncTest(unittest.TestCase):
             git("-C", str(work), "push", "-q", "--force", "origin", "HEAD:main", "v1")
             head = git("-C", str(work), "rev-parse", "HEAD")
 
-            sync.sync_repo("acme/docs")
-
             target = sync.repository_target("acme/docs")
+            for name in ("HEAD.lock", "refs/remotes/origin/main.lock"):
+                (target / ".git" / name).write_text("stale")
+            self.assertTrue(sync.sync_once())
+            self.assertEqual(sync.check_ready(), 0)
             self.assertEqual(git("-C", str(target), "rev-parse", "HEAD"), head)
             self.assertEqual(git("-C", str(target), "rev-parse", "v1"), head)
 
